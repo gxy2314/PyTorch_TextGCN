@@ -90,8 +90,8 @@ def get_pmi_edge(content_lst, window_size=20, threshold=0.):
 
 class BuildGraph:
     def __init__(self, dataset):
-        clean_corpus_path = "data/text_dataset/clean_corpus"
-        self.graph_path = "data/graph"
+        clean_corpus_path = "PyTorch_TextSGC/data/text_dataset/clean_corpus"
+        self.graph_path = "PyTorch_TextSGC/data/graph"
         if not os.path.exists(self.graph_path):
             os.makedirs(self.graph_path)
 

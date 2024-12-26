@@ -96,8 +96,8 @@ def remove_less_word(lines_str, word_st):
 
 class CorpusProcess:
     def __init__(self, dataset, encoding=None):
-        corpus_path = "data/text_dataset/corpus"
-        clean_corpus_path = "data/text_dataset/clean_corpus"
+        corpus_path = "PyTorch_TextSGC/data/text_dataset/corpus"
+        clean_corpus_path = "PyTorch_TextSGC/data/text_dataset/clean_corpus"
         if not os.path.exists(clean_corpus_path):
             os.makedirs(clean_corpus_path)
 
@@ -150,10 +150,10 @@ class CorpusProcess:
 
 
 def main():
-    CorpusProcess("R52")
+    # CorpusProcess("R52")
     # CorpusProcess("20ng")
-    # CorpusProcess("mr")
-    # CorpusProcess("ohsumed")
+    CorpusProcess("mr")
+    CorpusProcess("ohsumed")
     # CorpusProcess("R8")
     # pass
 

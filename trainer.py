@@ -8,7 +8,7 @@ import pandas as pd
 import torch as th
 from sklearn.model_selection import train_test_split
 
-from layer import GCN
+from layer import SGC
 from utils import accuracy
 from utils import macro_f1
 from utils import CudaUse
@@ -41,7 +41,7 @@ def get_train_test(target_fn):
 class PrepareData:
     def __init__(self, args):
         print("prepare data")
-        self.graph_path = "data/graph"
+        self.graph_path = "PyTorch_TextSGC/data/graph"
         self.args = args
 
         # graph
@@ -57,25 +57,10 @@ class PrepareData:
 
         self.adj = preprocess_adj(adj, is_sparse=True)
 
-        # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
-
-        # features
-        self.nfeat_dim = graph.number_of_nodes()
-        row = list(range(self.nfeat_dim))
-        col = list(range(self.nfeat_dim))
-        value = [1.] * self.nfeat_dim
-        shape = (self.nfeat_dim, self.nfeat_dim)
-        indices = th.from_numpy(
-                np.vstack((row, col)).astype(np.int64))
-        values = th.FloatTensor(value)
-        shape = th.Size(shape)
-
-        self.features = th.sparse.FloatTensor(indices, values, shape)
-
         # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
         # target
 
-        target_fn = f"data/text_dataset/{self.args.dataset}.txt"
+        target_fn = f"PyTorch_TextSGC/data/text_dataset/{self.args.dataset}.txt"
         target = np.array(pd.read_csv(target_fn,
                                       sep="\t",
                                       header=None)[2])
@@ -89,7 +74,7 @@ class PrepareData:
         self.train_lst, self.test_lst = get_train_test(target_fn)
 
 
-class TextGCNTrainer:
+class TextSCGTrainer:
     def __init__(self, args, model, pre_data):
         self.args = args
         self.model = model
@@ -108,11 +93,10 @@ class TextGCNTrainer:
 
     def fit(self):
         self.prepare_data()
+        self.convert_tensor()
+
         self.model = self.model(nfeat=self.nfeat_dim,
-                                nhid=self.args.nhid,
-                                nclass=self.nclass,
-                                dropout=self.args.dropout)
-        print(self.model.parameters)
+                                nclass=self.nclass)
         self.model = self.model.to(self.device)
 
         self.optimizer = th.optim.Adam(self.model.parameters(), lr=self.args.lr)
@@ -120,11 +104,10 @@ class TextGCNTrainer:
 
         self.model_param = sum(param.numel() for param in self.model.parameters())
         print('# model parameters:', self.model_param)
-        self.convert_tensor()
 
         start = time()
         self.train()
-        self.train_time = time() - start
+        self.train_time = time() - start + self.pre_time
 
     @classmethod
     def set_description(cls, desc):
@@ -138,8 +121,6 @@ class TextGCNTrainer:
 
     def prepare_data(self):
         self.adj = self.predata.adj
-        self.nfeat_dim = self.predata.nfeat_dim
-        self.features = self.predata.features
         self.target = self.predata.target
         self.nclass = self.predata.nclass
 
@@ -149,27 +130,70 @@ class TextGCNTrainer:
                                                         random_state=self.args.seed)
         self.test_lst = self.predata.test_lst
 
+    @th.no_grad()
+    def sgc_precompute(self, sp_adj, adj_dense, train_lst, val_lst, test_lst):
+        start = time()
+
+        # train
+        feats = adj_dense[:, train_lst].to(self.device)
+        feats = th.spmm(sp_adj, feats).t()
+
+        train_feats_max, _ = feats.max(dim=0, keepdim=True)
+        train_feats_min, _ = feats.min(dim=0, keepdim=True)
+
+        train_feats_range = train_feats_max - train_feats_min
+        useful_features_dim = train_feats_range.squeeze().gt(0).nonzero().squeeze()
+        feats = feats[:, useful_features_dim]
+        train_feats_range = train_feats_range[:, useful_features_dim]
+        train_feats_min = train_feats_min[:, useful_features_dim]
+        train_vec = ((feats - train_feats_min) / train_feats_range)
+
+        # val
+        feats = adj_dense[:, val_lst].to(self.device)
+        feats = th.spmm(sp_adj, feats).t()
+        feats = feats[:, useful_features_dim]
+        val_vec = ((feats - train_feats_min) / train_feats_range)
+
+        # test
+        feats = adj_dense[:, test_lst].to(self.device)
+        feats = th.spmm(sp_adj, feats).t()
+        feats = feats[:, useful_features_dim]
+        test_vec = ((feats - train_feats_min) / train_feats_range).cpu()
+
+        print(train_vec.size())
+        print(val_vec.size())
+        print(test_vec.size())
+        return train_vec, val_vec, test_vec, time() - start
+
     def convert_tensor(self):
-        self.model = self.model.to(self.device)
-        self.adj = self.adj.to(self.device)
-        self.features = self.features.to(self.device)
         self.target = th.tensor(self.target).long().to(self.device)
+
         self.train_lst = th.tensor(self.train_lst).long().to(self.device)
         self.val_lst = th.tensor(self.val_lst).long().to(self.device)
+        self.test_lst = th.tensor(self.test_lst).long().to(self.device)
+
+        adj_dense = self.adj.to_dense().to(self.device)
+        self.adj = self.adj.to(self.device)
+        self.train_vec, self.val_vec, self.test_vec, self.pre_time = self.sgc_precompute(self.adj,
+                                                                                         adj_dense,
+                                                                                         self.train_lst,
+                                                                                         self.val_lst,
+                                                                                         self.test_lst)
+        self.nfeat_dim = self.train_vec.size(1)
 
     def train(self):
         for epoch in range(self.max_epoch):
             self.model.train()
             self.optimizer.zero_grad()
 
-            logits = self.model.forward(self.features, self.adj)
-            loss = self.criterion(logits[self.train_lst],
+            logits = self.model.forward(self.train_vec)
+            loss = self.criterion(logits,
                                   self.target[self.train_lst])
 
             loss.backward()
             self.optimizer.step()
 
-            val_desc = self.val(self.val_lst)
+            val_desc = self.val(self.val_vec, self.val_lst)
 
             desc = dict(**{"epoch"     : epoch,
                            "train_loss": loss.item(),
@@ -181,16 +205,16 @@ class TextGCNTrainer:
                 break
 
     @th.no_grad()
-    def val(self, x, prefix="val"):
+    def val(self, feats, ind, prefix="val"):
         self.model.eval()
         with th.no_grad():
-            logits = self.model.forward(self.features, self.adj)
-            loss = self.criterion(logits[x],
-                                  self.target[x])
-            acc = accuracy(logits[x],
-                           self.target[x])
-            f1, precision, recall = macro_f1(logits[x],
-                                             self.target[x],
+            logits = self.model.forward(feats)
+            loss = self.criterion(logits,
+                                  self.target[ind])
+            acc = accuracy(logits,
+                           self.target[ind])
+            f1, precision, recall = macro_f1(logits,
+                                             self.target[ind],
                                              num_classes=self.nclass)
 
             desc = {
@@ -204,8 +228,9 @@ class TextGCNTrainer:
 
     @th.no_grad()
     def test(self):
-        self.test_lst = th.tensor(self.test_lst).long().to(self.device)
-        test_desc = self.val(self.test_lst, prefix="test")
+        test_vec = self.test_vec.to(self.device)
+        test_lst = th.tensor(self.test_lst).long().to(self.device)
+        test_desc = self.val(test_vec, test_lst, prefix="test")
         test_desc["train_time"] = self.train_time
         test_desc["model_param"] = self.model_param
         return test_desc
@@ -221,8 +246,8 @@ def main(dataset, times):
     args.dropout = 0.5
     args.val_ratio = 0.1
     args.early_stopping = 10
-    args.lr = 0.02
-    model = GCN
+    args.lr = 0.01
+    model = SGC
 
     print(args)
 
@@ -236,7 +261,7 @@ def main(dataset, times):
         args.seed = seed
         seed_lst.append(seed)
 
-        framework = TextGCNTrainer(model=model, args=args, pre_data=predata)
+        framework = TextSCGTrainer(model=model, args=args, pre_data=predata)
         framework.fit()
 
         if th.cuda.is_available():
